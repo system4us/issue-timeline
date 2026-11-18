@@ -1,0 +1,47 @@
+{
+  "name": "issue-timeline",
+  "version": "1.0.0-beta.1",
+  "description": "Read-only timeline of GitHub and GitLab issues and pull/merge requests, with analysis, hierarchy and dependencies.",
+  "type": "module",
+  "bin": {
+    "issue-timeline": "server/src/index.js"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/system4us/issue-timeline.git"
+  },
+  "homepage": "https://github.com/system4us/issue-timeline#readme",
+  "bugs": {
+    "url": "https://github.com/system4us/issue-timeline/issues"
+  },
+  "keywords": [
+    "issues",
+    "pull-requests",
+    "timeline",
+    "github",
+    "gitlab",
+    "project-management",
+    "dependencies",
+    "analytics"
+  ],
+  "files": [
+    "server/src",
+    "web/dist",
+    "README.md",
+    "LICENSE",
+    "CONTRIBUTING.md"
+  ],
+  "scripts": {
+    "install:all": "npm install --prefix web",
+    "dev:server": "node server/src/index.js",
+    "dev:web": "npm run dev --prefix web",
+    "build": "npm run build --prefix web",
+    "start": "node server/src/index.js",
+    "test": "node --test server/src/*.test.js server/test/*.test.js && npm test --prefix web",
+    "prepack": "npm run install:all && npm run build"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
