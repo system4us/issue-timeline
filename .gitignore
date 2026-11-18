@@ -1,0 +1,15 @@
+node_modules
+data/
+web/dist
+*.log
+server.log
+server.pid
+mysql-ssl/
+server.cas
+server.crt
+server.key
+*.tar.gz
+bin/
+internal/webui/dist/*
+!internal/webui/dist/README
+dist/
