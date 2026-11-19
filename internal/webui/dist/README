@@ -1,0 +1,1 @@
+Placeholder so the binary builds without a UI. `make ui` replaces this folder with the built web app.

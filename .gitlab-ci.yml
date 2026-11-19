@@ -1,0 +1,132 @@
+# Pipeline: test on every push; on a version tag (vX.Y.Z) it builds the binaries and publishes them to npm.
+# Required CI/CD variables (Settings > CI/CD > Variables, masked):
+#   NPM_TOKEN            an npm token that may publish issue-timeline and the issue-timeline-<os>-<cpu> packages (a
+#                        granular token limited to one package cannot create the platform ones the first time)
+#   DOCKERHUB_USERNAME   Docker Hub username for pushing system4us/issue-timeline
+#   DOCKERHUB_TOKEN      Docker Hub access token (Read & Write)
+# The npm package runs the Go binary: issue-timeline (a small launcher) plus one package per platform with its binary,
+# installed by npm only where it fits (see scripts/npm.mjs).
+
+stages:
+  - test
+  - package
+  - publish
+
+variables:
+  NODE_VERSION: "22.23.5"
+
+# Go (Debian: the race detector needs glibc) with Node, which builds and tests the web app and runs the end-to-end test.
+.go_node: &go_node
+  image: golang:1.26-bookworm
+  before_script:
+    - curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz" | tar -xz -C /usr/local --strip-components=1
+    - node --version && go version
+
+test:
+  <<: *go_node
+  stage: test
+  script:
+    - make deps
+    - make gen-check
+    - test -z "$(gofmt -l cmd internal)" || { gofmt -l cmd internal; exit 1; }
+    - go vet ./...
+    - make test
+
+pack:
+  <<: *go_node
+  stage: package
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/
+  script:
+    - make deps ui
+    - node scripts/npm.mjs "${CI_COMMIT_TAG#v}"
+  artifacts:
+    paths:
+      - dist/npm/*.tgz
+    expire_in: 30 days
+
+publish_npm:
+  stage: publish
+  image: node:22-alpine
+  needs: [pack]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/
+  variables:
+    NPM_REGISTRY: https://registry.npmjs.org/
+  script:
+    - echo "registry=${NPM_REGISTRY}" > .npmrc
+    - echo "//$(echo ${NPM_REGISTRY} | sed -E 's#^https?://##; s#/+$##')/:_authToken=${NPM_TOKEN}" >> .npmrc
+    # Pre-releases (vX.Y.Z-beta.N) go under the "beta" dist-tag, so "latest" keeps the last stable version.
+    - VERSION="${CI_COMMIT_TAG#v}"
+    - case "$VERSION" in *-*) TAG=beta ;; *) TAG=latest ;; esac
+    - MAIN="dist/npm/issue-timeline-${VERSION}.tgz"
+    - test -f "$MAIN"
+    # the platform packages first: the main one depends on them at this version
+    - for f in dist/npm/issue-timeline-*.tgz; do [ "$f" = "$MAIN" ] || npm publish "$f" --access public --tag "$TAG" || exit 1; done
+    - npm publish "$MAIN" --access public --tag "$TAG"
+
+# Mirror to GitHub: GitLab is the source of truth, with the full history. GitHub is the public copy and gets a single
+# commit: a snapshot of the tree of HEAD with no history behind it. Pushed as the "system4us" GitHub App (see
+# scripts/gh-app-token.mjs and README). A version tag is put on that snapshot too.
+# Required variables: GH_APP_ID, GH_INSTALLATION_ID, and GH_APP_PRIVATE_KEY (or GH_APP_PRIVATE_KEY_FILE).
+mirror_github:
+  stage: publish
+  image: node:22-alpine
+  needs: [test]
+  before_script:
+    - apk add --no-cache git
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/
+  script:
+    - TOKEN=$(node scripts/gh-app-token.mjs)
+    - git remote add github "https://x-access-token:${TOKEN}@github.com/system4us/issue-timeline.git"
+    # One commit with no parents: the tree of HEAD, under a neutral identity (no personal email leaves GitLab).
+    - export GIT_AUTHOR_NAME="issue-timeline" GIT_AUTHOR_EMAIL="issue-timeline@users.noreply.github.com"
+    - export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+    - SNAP=$(git commit-tree "HEAD^{tree}" -m "$(git log -1 --format=%s HEAD)")
+    - git push --force github "$SNAP:refs/heads/main"
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        git tag -f "$CI_COMMIT_TAG" "$SNAP"
+        git push --force github "refs/tags/$CI_COMMIT_TAG:refs/tags/$CI_COMMIT_TAG"
+      fi
+
+# Publish Docker image to Docker Hub (system4us/issue-timeline):
+#   main            -> :edge
+#   vX.Y.Z-beta.N   -> :X.Y.Z-beta.N and :beta
+#   vX.Y.Z          -> :X.Y.Z and :latest
+publish_docker:
+  stage: publish
+  image: docker:27
+  services:
+    - docker:27-dind
+  needs: [test]
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKERHUB_IMAGE: "system4us/issue-timeline"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/
+  before_script:
+    - printf '%s' "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+  script:
+    - |
+      set -eu
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        VERSION="${CI_COMMIT_TAG#v}"
+        case "$VERSION" in *-*) DIST_TAG=beta ;; *) DIST_TAG=latest ;; esac
+        TAGS="${DOCKERHUB_IMAGE}:${VERSION} ${DOCKERHUB_IMAGE}:${DIST_TAG}"
+      else
+        TAGS="${DOCKERHUB_IMAGE}:edge"
+      fi
+      BUILD_ARGS=""
+      for t in $TAGS; do
+        BUILD_ARGS="$BUILD_ARGS -t $t"
+      done
+      docker build $BUILD_ARGS .
+      for t in $TAGS; do
+        docker push "$t"
+      done
+  after_script:
+    - docker logout || true

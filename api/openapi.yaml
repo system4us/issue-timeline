@@ -1,0 +1,1863 @@
+openapi: 3.1.0
+info:
+  title: issue-timeline API
+  version: 1.0.0-beta.4
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  description: |
+    The HTTP API of issue-timeline: the JSON the web page reads and writes. Every route is under `/api/`. The web page
+    and this document are served by the same server. Errors are JSON objects `{ "error": "..." }` with the status the
+    operation lists. Unknown fields in a request body are ignored. A path segment is URL-encoded (a linked pull request's
+    key contains `#`, so it is sent as `%23`).
+
+    **Who may call it.**
+
+    - A request from this machine (loopback address, and no proxy header such as `X-Forwarded-For`, `Forwarded` or
+      `X-Real-IP`) uses this machine's own identity: the `gh` and `glab` sessions and the stored secrets. It needs no
+      cookie. Only such a request can add repos, link tracker and code repos, and edit with the local identity.
+    - Any other request needs a session: sign in with `POST /api/session` (a Redmine API key, a GitHub token or a GitLab
+      token, checked on the host there), then send the cookie `it_session` that the answer sets. Without a session, every
+      `/api/` route answers 401, except `/api/session`, which is open, and `/api/me`, which answers 401 `not signed in`.
+      Sessions are kept in memory only: they end after `SESSION_IDLE_HOURS` without use or `SESSION_MAX_DAYS` after the
+      sign-in, and a restart signs everyone out. Jira has no sign-in yet.
+    - The `Host` header must name this server (a loopback name, the bind address, this machine's own names and addresses,
+      or `ALLOWED_HOSTS`). Any other `Host` answers 421. This blocks DNS rebinding.
+    - Writes (`POST`, `PUT`, `PATCH`, `DELETE`) must carry the header `x-issue-timeline: 1`, which a browser only sends from
+      the app's own code (a custom header needs a CORS preflight, which is never granted). An `Origin` header, when the
+      browser sends one, must equal the `Host`. Otherwise the write answers 403.
+
+    **Roles.** The role of a signed-in person is read from their host with their own credential, and kept for a few
+    minutes. A person sees only the repos their host gives them a role in; a repo they have no role in answers as not configured (404 `repo not configured`).
+
+    - **admin**: a Redmine administrator, a GitHub repo admin, a GitLab Owner. Edits, and may also switch the repo between
+      read and write mode (`PUT /api/repo-mode`).
+    - **editor**: a Redmine member whose role is Manager or Developer (the list can be set in `roles.json`), GitHub maintain,
+      push or triage, GitLab Developer and up. Edits in a repo that is in write mode.
+    - **viewer**: any other member. Reads the repo, cannot edit.
+    - **not a member**: the repo is not shown.
+
+    A request from this machine without a session acts as the local identity: it reads every configured repo and may edit and switch any of them.
+
+    **What is seen.** The records come from the sync, which reads with the local identity. A signed-in person does not see
+    more than their own credential could read on the host: a GitLab confidential issue only when their token lists it,
+    internal GitLab notes and, below Reporter, GitLab pulls, commits, diffs and CI are hidden; on Redmine, the issues their
+    key lists and the private notes their key can read. Records hidden from a person are left out of the responses, and a
+    single record asked for by key answers 404.
+
+    **Repo selection.** Routes that read one repo take the `repo` query parameter. Without it, the first repo the caller may
+    see is used. A route under `/api/` whose repo is not configured, or not visible to the caller, answers 404.
+
+    **Repo modes.** A repo is `read` (the default, and what a new repo gets) or `write`. Every edit needs `write` and answers
+    403 otherwise.
+
+    **Status codes used.** 200, 201 and 202 for success; 400 for a request that is wrong; 401 for no session or a refused
+    key; 403 for a write that is refused (no header, another origin, read-only repo, a role that may not edit, or a
+    change that needs this machine); 404 for a record, a repo or a route that does not exist, or that the caller may not see; 413 for a body that is too large; 421
+    for a `Host` this server does not answer to; 500 for an unexpected error; 501 for an operation the host does not have (Jira's edits and refresh, pull requests on Redmine and Jira); 502 when the host (GitHub, GitLab, Redmine, Jira) failed or answered with an error this server does not pass on.
+servers:
+  - url: /
+    description: The server the page is served from
+security:
+  - itSession: []
+  - {}
+tags:
+  - name: contract
+    description: This document and its rendered page
+  - name: session
+    description: Signing in and out
+  - name: repos
+    description: Repos, their modes and the tracker-to-code links
+  - name: records
+    description: Issues, pull and merge requests, and what the page reads about them
+  - name: edits
+    description: Changes sent to the host (GitHub, GitLab, Redmine)
+  - name: commits
+    description: Commits of the code repos, their files and merge methods
+  - name: sync
+    description: Reading the host again
+
+paths:
+  /api/openapi.yaml:
+    get:
+      tags: [contract]
+      operationId: getOpenApiDocument
+      summary: This OpenAPI document
+      description: |
+        Returns this file. It needs no session: anyone who can reach the server (the Host check still applies) may read the
+        contract. Its TypeScript types are generated into the web app (`web/src/api/schema.d.ts`).
+      security: []
+      responses:
+        "200":
+          description: The OpenAPI document
+          content:
+            application/yaml:
+              schema: { type: string }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+  /api/docs:
+    get:
+      tags: [contract]
+      operationId: getApiDocs
+      summary: This API as a web page
+      description: An HTML page that renders `/api/openapi.yaml`. It needs no session, like the document it shows.
+      security: []
+      responses:
+        "200":
+          description: The rendered documentation
+          content:
+            text/html:
+              schema: { type: string }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/me:
+    get:
+      tags: [session]
+      operationId: getMe
+      summary: The person signed in
+      description: |
+        Who the session belongs to, with the host and the site it signed in to. Answers 401 when there is no session, which
+        is the normal answer for a browser that is not signed in (also for a request from this machine, which has no session
+        unless it signed in). Anyone may call it.
+      responses:
+        "200":
+          description: The signed-in person
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/sign-in-options:
+    get:
+      tags: [session]
+      operationId: getSignInOptions
+      summary: The ways to sign in this server offers
+      description: |
+        One entry per host of the configured repos that signs people in (GitHub, GitLab, Redmine): `token` is a pasted
+        personal access token (GitHub, GitLab) or API key (Redmine), through `POST /api/session`; `oauth` is the host's
+        own sign-in page, through `GET /api/oauth/{provider}/start`, when the server has an app registered there
+        (`GITHUB_OAUTH_CLIENT_ID`/`_SECRET`, `GITLAB_OAUTH_CLIENT_ID`/`_SECRET`). Needs no session.
+      security: []
+      responses:
+        "200":
+          description: The methods
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SignInOptions" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/oauth/{provider}/start:
+    get:
+      tags: [session]
+      operationId: startOAuth
+      summary: Sign in on the host's own page (GitHub, GitLab)
+      description: |
+        Sends the browser to the host's consent page, with a random state (also set as the `it_oauth` cookie, so the
+        sign-in completes only in this browser) and a PKCE challenge. The host sends it back to `callback`. `return` is
+        the page of this site to come back to. 404 when the server has no app on that host.
+      security: []
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string, enum: [github, gitlab] } }
+        - { name: return, in: query, required: false, schema: { type: string }, description: "A path of this site (default /)" }
+      responses:
+        "302":
+          description: To the host's consent page
+          headers:
+            Location: { schema: { type: string } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/oauth/{provider}/callback:
+    get:
+      tags: [session]
+      operationId: oauthCallback
+      summary: Where the host sends the person back
+      description: |
+        Trades the code for the person's token (with the PKCE verifier), checks who they are on the host and starts a
+        session (`it_session`). A token that expires (GitLab's, a GitHub App's) is renewed by the server before it does.
+        Then back to the page the sign-in started from; on any failure, to it with `?signin_error=<message>`. Register
+        `<PUBLIC_URL>/api/oauth/{provider}/callback` as the app's callback URL.
+      security: []
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string, enum: [github, gitlab] } }
+        - { name: code, in: query, required: false, schema: { type: string } }
+        - { name: state, in: query, required: false, schema: { type: string } }
+        - { name: error, in: query, required: false, schema: { type: string } }
+        - { name: error_description, in: query, required: false, schema: { type: string } }
+      responses:
+        "302":
+          description: "Back to the page: signed in, or with ?signin_error="
+          headers:
+            Location: { schema: { type: string } }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/session:
+    post:
+      tags: [session]
+      operationId: signIn
+      summary: Sign in with a host key or token
+      description: |
+        Checks the key or token on the host and, when the host accepts it, starts a session. The answer sets the cookie
+        `it_session` (HttpOnly, SameSite=Strict, Secure when `COOKIE_SECURE` is set or a proxy says HTTPS). A new sign-in
+        replaces the old session. The site must be one of the sites this server reads (the `instance` is never a
+        free address): for GitHub the one GitHub host of the run, for GitLab the `instance` or the only GitLab site configured,
+        for Redmine the `instance`. Anyone may call it. The body is at most 64 KB.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/WriteHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SignIn" }
+      responses:
+        "200":
+          description: Signed in; the session cookie is set
+          headers:
+            set-cookie:
+              description: "`it_session=<id>; Path=/; HttpOnly; SameSite=Strict` (with `Secure` when set)"
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: The host refused the key or token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+    delete:
+      tags: [session]
+      operationId: signOut
+      summary: End the session
+      description: Ends the session of the cookie, if any, and clears the cookie. Anyone may call it; it always answers 200.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/WriteHeader"
+      responses:
+        "200":
+          description: Signed out; the cookie is cleared
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SignedOut" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/repos:
+    get:
+      tags: [repos]
+      operationId: listRepos
+      summary: The repos the caller may see
+      description: |
+        The configured repos the caller may see, with the tracker-to-code links that are visible to them, each repo's mode
+        and whether the caller may configure repos. `canConfigure` is true only for a request from this machine: only then
+        can repos be added and linked. A signed-in person sees the repos they have a role in.
+      responses:
+        "200":
+          description: The repos
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RepoList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+    post:
+      tags: [repos]
+      operationId: addRepo
+      summary: Add a repo
+      description: |
+        Adds a repo to the configured ones. Only from this machine (403 otherwise). The host must confirm the repo exists and
+        that the local identity can read it; the repo is saved only then. A repo already configured is not added again: with
+        `mode` it is switched, and the answer is 200 with `added: false`. A new repo is read until it is switched to write.
+        The repo key is the one a `repo` query parameter names: `owner/name` on GitHub, `gitlab:<site>/<group/project>`,
+        `redmine:<site>/<identifier>`, `jira:<site>/<KEY>`. Also starts a sync of the new repo.
+      parameters:
+        - $ref: "#/components/parameters/WriteHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RepoAdd" }
+      responses:
+        "200":
+          description: "The repo was already configured (`added: false`); its mode may have been set"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RepoAdded" }
+        "201":
+          description: The repo was added
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RepoAdded" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/repo-mode:
+    put:
+      tags: [repos]
+      operationId: setRepoMode
+      summary: Switch a repo between read and write
+      description: |
+        Sets the mode of one repo. Allowed from this machine, or by an admin of the repo on its host. A repo that is not
+        configured answers 404 (this route checks the repo before the others do). Writing is chosen on purpose: the server
+        keeps the choice.
+      parameters:
+        - $ref: "#/components/parameters/WriteHeader"
+        - $ref: "#/components/parameters/RepoRequired"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RepoModeInput" }
+      responses:
+        "200":
+          description: The mode is set
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RepoModeSet" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/links:
+    post:
+      tags: [repos]
+      operationId: saveLinks
+      summary: Link a tracker to code repos
+      description: |
+        Sets which code repos (GitHub, GitLab) a tracker (Jira, Redmine) names by key: their pull requests and commits then
+        show on the tracker. An empty `code` list unlinks it. Only from this machine (403 otherwise), because linking uses
+        this machine's credentials.
+      parameters:
+        - $ref: "#/components/parameters/WriteHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Links" }
+      responses:
+        "200":
+          description: The links are saved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LinksSaved" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/data:
+    get:
+      tags: [records]
+      operationId: getData
+      summary: The records of one repo, lightweight, with links, tree, dependencies and sync status
+      description: |
+        Everything the timeline page draws for one repo: the issues and pulls without their bodies, comments and events
+        (those come from `GET /api/issues/{key}` and `GET /api/pulls/{key}`), the links, the hierarchy and the dependencies,
+        the CI summary, the repo's mode, the code repos linked to a tracker (visible to the caller), and the sync status.
+        A linked tracker's pulls are the pulls of its code repos, keyed `label#N`. A signed-in person gets only the records
+        their host lets them read.
+      parameters:
+        - $ref: "#/components/parameters/Repo"
+      responses:
+        "200":
+          description: The payload of the repo
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Payload" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/search:
+    get:
+      tags: [records]
+      operationId: searchRecords
+      summary: Search the issues and pulls of one repo
+      description: |
+        Matches the key (a number or `PROJ-12`, with or without `#`), the title and the text of the body and comments, in
+        that order of relevance. For a linked tracker the linked pulls are searched too. An empty `q` answers an empty list.
+        At most 50 results.
+      parameters:
+        - $ref: "#/components/parameters/Repo"
+        - $ref: "#/components/parameters/Q"
+      responses:
+        "200":
+          description: The matches
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/issues/{key}:
+    parameters:
+      - $ref: "#/components/parameters/KeyPath"
+    get:
+      tags: [records]
+      operationId: getIssue
+      summary: One issue, in full
+      description: |
+        The record the server keeps for one issue: its body, comments, events, relations and, for Redmine, its form fields.
+        Anyone the host lets read the issue may read it; otherwise 404.
+      parameters:
+        - $ref: "#/components/parameters/Repo"
+      responses:
+        "200":
+          description: The record
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Detail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+    patch:
+      tags: [edits]
+      operationId: editIssue
+      summary: Edit an issue on its host
+      description: |
+        Sends the change to the host first, then keeps what the host now says (read back, merged onto the stored record).
+        Needs the repo in `write` mode and an editor's role (or the local identity, from this machine). Redmine accepts the
+        fields of `IssueChanges` it supports (relations are their own requests on Redmine); GitHub and GitLab accept
+        `IssueChanges` too, with relations and the parent as their own requests. Fields a host does not support are ignored,
+        and what the host did not keep is returned in `warnings`. A body with no known field answers 400. Jira answers 501 once the write mode is checked. The state (`OPEN` or `CLOSED`) is checked on every host: another value answers 400. The body may be 40 MB, because attachments are sent in it as base64, at most 5 files of 5 MB.
+      parameters:
+        - $ref: "#/components/parameters/WriteHeader"
+        - $ref: "#/components/parameters/Repo"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/IssueChanges" }
+      responses:
+        "200":
+          description: The issue as the host now has it
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IssueEdited" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+  /api/pulls/{key}:
+    parameters:
+      - $ref: "#/components/parameters/KeyPath"
+    get:
+      tags: [records]
+      operationId: getPull
+      summary: One pull or merge request, in full
+      description: |
+        The record the server keeps for one pull request (GitHub) or merge request (GitLab): body, comments, events, commits
+        and reviews. A linked pull of a tracker is keyed `label#N`, where the label is the code repo's name, and is found
+        through the tracker. A key that is not a pull of the repo answers 404; Redmine and Jira have no pulls of their own.
+      parameters:
+        - $ref: "#/components/parameters/Repo"
+      responses:
+        "200":
+          description: The record
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Detail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+    patch:
+      tags: [edits]
+      operationId: editPull
+      summary: Edit a pull request (GitHub) or merge request (GitLab)
+      description: |
+        Changes the title, description, state (`OPEN` or `CLOSED`; a merge is not an edit), labels, assignees, milestone,
+        reviewers, draft flag or adds a comment, on the host, then keeps the host's answer. Needs `write` mode and an editor's
+        role. A merged pull stays merged. Redmine and Jira have no pull requests: the route answers 501 for them.
+      parameters:
+        - $ref: "#/components/parameters/WriteHeader"
+        - $ref: "#/components/parameters/Repo"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PullChanges" }
+      responses:
+        "200":
+          description: The pull request as kept now
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+  /api/issues:
+    post:
+      tags: [edits]
+      operationId: createIssue
+      summary: Create an issue on GitHub, GitLab or Redmine
+      description: |
+        Creates an issue in the repo, with the same gate as an edit: `write` mode and an editor's role (or the local
+        identity). A title is needed. On Redmine the fields are the ones of `NewIssue` that Redmine takes (tracker, priority,
+        assignee, version, category, parent, dates, privacy). Jira answers 501, and an unknown repo 404.
+      parameters:
+        - $ref: "#/components/parameters/WriteHeader"
+        - $ref: "#/components/parameters/Repo"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewIssue" }
+      responses:
+        "201":
+          description: The issue as the host made it
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Record" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+  /api/edit-options:
+    get:
+      tags: [edits]
+      operationId: getEditOptions
+      summary: What an edit form offers in one repo
+      description: |
+        The lists the issue form offers: trackers, priorities, members, versions, categories, custom fields and, where the
+        host has them, labels, milestones, activities and issue types. Read with the caller's own credential when signed in.
+        For Redmine they are cached for five minutes, for the local identity only. On GitHub and GitLab the caller needs an
+        editor's role, otherwise 403 (the reason is in the message). Jira answers 501.
+      parameters:
+        - $ref: "#/components/parameters/Repo"
+      responses:
+        "200":
+          description: The lists
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EditOptions" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+  /api/refresh-record:
+    post:
+      tags: [sync]
+      operationId: refreshRecord
+      summary: Read one issue or pull request again from its host
+      description: |
+        Reads one record from the host, when it is opened, and keeps what the host says now. A record read less than a minute
+        ago is not read again: the answer is 200 with `throttled: true`. Redmine answers 404 when it no longer shows the issue.
+        Jira answers 501. A host failure answers 502.
+      parameters:
+        - $ref: "#/components/parameters/WriteHeader"
+        - $ref: "#/components/parameters/Repo"
+        - $ref: "#/components/parameters/Kind"
+        - $ref: "#/components/parameters/Key"
+      responses:
+        "200":
+          description: The record (`changed` says whether anything moved)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RefreshResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+  /api/commits:
+    get:
+      tags: [commits]
+      operationId: listCommits
+      summary: The commits of a repo, a page at a time
+      description: |
+        The default branch's commits, newest first, filtered on the server. A PR's own commits (`pr`) join the list, even
+        those that never reached the default branch (`inHistory` is false for them). For a linked tracker, the commits of its
+        linked code repos, each with its repo. `q` matches the title (case-insensitive) or the start of the sha; `author` the
+        author's name. Each row names the pull request and the issues it belongs to, when it names them.
+      parameters:
+        - $ref: "#/components/parameters/Repo"
+        - $ref: "#/components/parameters/Q"
+        - $ref: "#/components/parameters/Author"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/PrKey"
+        - $ref: "#/components/parameters/IssueFilter"
+      responses:
+        "200":
+          description: One page
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/commit:
+    get:
+      tags: [commits]
+      operationId: getCommit
+      summary: One commit with its files and diffs
+      description: |
+        The commit's files and patches. The first request asks the host and keeps the result in the diff cache; the next ones
+        read the cache. Any commit of the repo works, not only the default branch's (a PR's own commits are on the host too).
+        A tracker's commit is read from the code repo that has it. A tracker with no linked code repo has no commits: 404.
+        A sha that is neither a commit the store knows nor a full 40-digit sha is 404. A commit the caller may not see is 404 too. A host failure answers 502.
+      parameters:
+        - $ref: "#/components/parameters/Repo"
+        - $ref: "#/components/parameters/Sha"
+      responses:
+        "200":
+          description: The commit
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitDetail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/merge:
+    get:
+      tags: [commits]
+      operationId: getMergeMethod
+      summary: How a merged pull request landed
+      description: |
+        `squash`, `merge commit` or `rebase`, asked of the host once per pull and kept in memory. `method` is null for a pull
+        that is not merged, or when the host cannot say. A pull the repo does not show answers 404; a host failure answers 502.
+      parameters:
+        - $ref: "#/components/parameters/Repo"
+        - $ref: "#/components/parameters/Number"
+      responses:
+        "200":
+          description: The merge method
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MergeMethod" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/sync:
+    post:
+      tags: [sync]
+      operationId: startSync
+      summary: Start a sync of one repo in the background
+      description: |
+        Reads the repo again from its host, in the background: what changed since the last sync, or everything with `full=1`
+        (the store also does a full read once a day). Then the commits and CI runs. The answer comes at once; the progress is
+        in `status` of `GET /api/data`. `started` says whether this call started a sync (false when one was already running).
+        Needs the write header; any signed-in person who may see the repo, or the local identity, may start it.
+      parameters:
+        - $ref: "#/components/parameters/WriteHeader"
+        - $ref: "#/components/parameters/Repo"
+        - $ref: "#/components/parameters/Full"
+      responses:
+        "202":
+          description: The sync is accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SyncStarted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+  /api/events:
+    get:
+      tags: [sync]
+      operationId: streamEvents
+      summary: Follow what changes in one repo (server-sent events)
+      description: |
+        A stream (`text/event-stream`) for a page open on the repo: an `event: change` each time a record is edited, a
+        sync starts or ends, or a webhook made the server read the repo again. The data is a `ChangeEvent` (JSON): it names the
+        records and the reason, never their content, so the page reads what it may see through the usual routes. Records
+        hidden from the caller are left out of an event, and an edit event left with none is not sent. A comment line
+        (`: ping`) comes every 25 seconds; the stream ends when the caller's session does, or when the server stops, and
+        the browser's `EventSource` reconnects on its own (`retry: 3000`).
+      parameters:
+        - $ref: "#/components/parameters/Repo"
+      responses:
+        "200":
+          description: "The stream. Each message is `event: change` with a `ChangeEvent` as its `data`."
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              x-event-data: { $ref: "#/components/schemas/ChangeEvent" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+  /api/webhook:
+    post:
+      tags: [sync]
+      operationId: receiveWebhook
+      summary: The one webhook every host posts to
+      description: |
+        A delivery from GitHub, GitLab, Jira or anything else, checked against the one secret the server was started with
+        (`WEBHOOK_SECRET`; without it this route answers 404). Each host is checked its own way:
+
+        - GitHub: `X-GitHub-Event` and `X-Hub-Signature-256` (`sha256=` + the HMAC-SHA256 of the body)
+        - GitLab: `X-Gitlab-Event` and `X-Gitlab-Token` (the secret itself)
+        - Jira Cloud: `X-Hub-Signature` (as GitHub's), from a webhook created with the secret
+        - anything else (Redmine through a plugin, a script): the secret in `X-Issue-Timeline-Token`, or as `?token=`
+          when the sender cannot set a header, and a body `{"repo": "<repo key>"}` (or the redmine_webhook plugin's payload)
+
+        The delivery names a repo; each configured one it matches is synced about two seconds later (a burst of
+        deliveries is one sync), and the periodic poll leaves it alone for 30 minutes after. Nothing of the payload is
+        kept: the sync reads what changed. Needs no session and no write header: the signature is the check.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "202":
+          description: "The delivery passed its check. `repos` are the configured repos it will sync (none for a ping, or for a repo not configured here)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebhookAccepted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413":
+          description: The delivery is larger than 25 MB
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "421": { $ref: "#/components/responses/MisdirectedRequest" }
+        "500": { $ref: "#/components/responses/ServerError" }
+
+components:
+  securitySchemes:
+    itSession:
+      type: apiKey
+      in: cookie
+      name: it_session
+      description: |
+        The session cookie `it_session`, set by `POST /api/session`. Not needed for a request from this machine (loopback,
+        no proxy header): that request uses the local identity. Every other `/api/` route answers 401 without it.
+  parameters:
+    WriteHeader:
+      name: x-issue-timeline
+      in: header
+      required: true
+      description: Every write (POST, PUT, PATCH, DELETE) must carry it. A browser only sends it from the app's own code. Otherwise 403.
+      schema: { type: string, const: "1" }
+    Repo:
+      name: repo
+      in: query
+      required: false
+      description: |
+        The repo key: `owner/name` (GitHub), `gitlab:<site>/<group/project>`, `redmine:<site>/<identifier>` or
+        `jira:<site>/<KEY>`. Without it, the first repo the caller may see. A repo that is not configured, or not visible to the caller, answers 404.
+      schema: { type: string }
+    RepoRequired:
+      name: repo
+      in: query
+      required: true
+      description: The repo key (see `repo`). A repo that is not configured answers 404.
+      schema: { type: string }
+    Q:
+      name: q
+      in: query
+      required: false
+      description: The text to search for (case-insensitive)
+      schema: { type: string, default: "" }
+    Author:
+      name: author
+      in: query
+      required: false
+      description: Only commits whose author's name contains this text (case-insensitive)
+      schema: { type: string, default: "" }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Rows in the page. Not a number, or below 1, means 100; above 500 means 500.
+      schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+    Offset:
+      name: offset
+      in: query
+      required: false
+      description: Rows to skip. Not a number, or below 0, means 0.
+      schema: { type: integer, minimum: 0, default: 0 }
+    PrKey:
+      name: pr
+      in: query
+      required: false
+      description: Only the commits of this pull request key (a number, or `label#N` on a tracker)
+      schema: { type: string }
+    IssueFilter:
+      name: issue
+      in: query
+      required: false
+      description: Only the commits that name this issue key (`12`, or `PROJ-12` on a tracker)
+      schema: { type: string }
+    Sha:
+      name: sha
+      in: query
+      required: true
+      description: The commit's sha (any case; a full 40-character sha, or one the store knows)
+      schema: { type: string }
+    Number:
+      name: number
+      in: query
+      required: true
+      description: "The pull or merge request's key: its number, or `label#N` on a tracker"
+      schema: { type: string }
+    Full:
+      name: full
+      in: query
+      required: false
+      description: "`1` reads everything again, not only what changed since the last sync. Any other value is an incremental sync."
+      schema: { type: string, enum: ["1"] }
+    Kind:
+      name: kind
+      in: query
+      required: false
+      description: Whether the record is an issue or a pull request. Any value other than `pull` means issue.
+      schema: { type: string, enum: [issue, pull], default: issue }
+    Key:
+      name: key
+      in: query
+      required: true
+      description: "The record's key: the number (`12`), or the tracker's key (`PROJ-12`)"
+      schema: { type: string }
+    KeyPath:
+      name: key
+      in: path
+      required: true
+      description: "The record's key, URL-encoded: the number (`12`), the tracker's key (`PROJ-12`), or a linked pull's `label#N` (sent as `label%23N`)"
+      schema: { type: string }
+  responses:
+    BadRequest:
+      description: The request is wrong (a missing or invalid field, a body that is not a JSON object)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: No session (sign in first), or the host refused the key
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: A write that is refused (no `x-issue-timeline` header, another origin, a read-only repo, a role that may not edit, or a change that needs this machine)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: The record, the commit or the repo does not exist, or the caller may not see it
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    PayloadTooLarge:
+      description: The body is larger than the route allows (1 MB, 64 KB for sign-in, 40 MB for an issue edit)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    MisdirectedRequest:
+      description: The `Host` header does not name this server
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ServerError:
+      description: An unexpected error on the server
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotImplemented:
+      description: The operation is not built for this tracker yet (Jira)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    BadGateway:
+      description: The host (GitHub, GitLab, Redmine or Jira) failed or refused the request; the message says why
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+
+    Ref:
+      description: |
+        A reference to another record: an issue or pull number, or a tracker key. Written as an integer when it is all
+        digits, as text otherwise (`PROJ-12`). Both forms are accepted on input, and compared as text.
+      oneOf:
+        - type: integer
+        - type: string
+
+    Label:
+      type: object
+      required: [name, color]
+      properties:
+        name: { type: string }
+        color: { type: string, description: "Hex without `#`, as the host gives it" }
+
+    Milestone:
+      type: object
+      required: [title, dueOn]
+      properties:
+        title: { type: string }
+        dueOn: { type: [string, "null"], description: "The version's date, when it has one" }
+
+    IdName:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+
+    Comment:
+      type: object
+      required: [id, author, createdAt, body]
+      properties:
+        id: { type: string }
+        author: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time }
+        body: { type: string }
+        private:
+          type: boolean
+          description: "True for a note only some people may read (a Redmine private note, a GitLab internal note). Left out when false. Shown only to someone the host lets read it."
+
+    Event:
+      type: object
+      description: One entry of a record's history. `type` says which other fields there are (label, assignee, reason, from, to, milestone, reviewer, source...).
+      required: [type, at, actor]
+      properties:
+        type: { type: string }
+        at: { type: string, format: date-time }
+        actor: { type: [string, "null"] }
+      additionalProperties: true
+
+    PullCommit:
+      type: object
+      required: [oid, message, at, author]
+      properties:
+        oid: { type: string }
+        message: { type: string }
+        at: { type: string, format: date-time }
+        author: { type: [string, "null"] }
+
+    Review:
+      type: object
+      required: [author, state, at, body]
+      properties:
+        author: { type: [string, "null"] }
+        state: { type: string }
+        at: { type: [string, "null"], format: date-time }
+        body: { type: string }
+
+    ParentEpic:
+      type: object
+      description: "GitLab: the epic (or other work item of the group) an issue belongs to, when it is not an issue of the project"
+      required: [iid, title, url, type]
+      properties:
+        iid: { type: integer }
+        title: { type: string }
+        url: { type: string }
+        type: { type: [string, "null"] }
+
+    CustomField:
+      type: object
+      required: [id, name, format, multiple, value]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        format: { type: [string, "null"], description: "The field's type (string, bool, user, link...), when the key may read the definitions" }
+        multiple: { type: boolean }
+        value:
+          description: What the tracker gives, as text, a list of texts for a field with several values, or null
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: string }
+            - type: "null"
+
+    Attachment:
+      type: object
+      required: [id, filename, filesize, contentType, author]
+      properties:
+        id: { type: integer }
+        filename: { type: string }
+        filesize: { type: [integer, "null"], format: int64 }
+        contentType: { type: [string, "null"] }
+        author: { type: [string, "null"] }
+
+    Relation:
+      type: object
+      description: A Redmine relation, by its own id
+      required: [id, type, from, to]
+      properties:
+        id: { type: integer }
+        type: { type: string }
+        from: { type: integer }
+        to: { type: integer }
+        delay: { type: [integer, "null"] }
+
+    Record:
+      type: object
+      description: |
+        An issue (`kind: issue`) or a pull/merge request (`kind: pull`) of any host, as the store keeps it and the API
+        serves it. Fields marked nullable are always written, as `null` when there is no value. Fields that are not
+        nullable and not required are absent when they are not set (the stored JSON leaves them out). A field this schema
+        does not name is kept and served as it is (`additionalProperties`).
+      required: [kind, id, key, number, title, body, url, author, createdAt, updatedAt, closedAt, state, labels, assignees, milestone, commentsCount, comments, events]
+      properties:
+        kind: { type: string, enum: [issue, pull] }
+        id: { type: string, description: "The host's own id, as text" }
+        key: { type: string, description: "The record's key as text: `12` on GitHub and GitLab, `PROJ-12` on Jira. A linked pull is `label#12`." }
+        number: { type: [integer, "null"], description: "The number the host gives (GitHub, GitLab, Redmine); null for trackers without one" }
+        title: { type: string }
+        body: { type: string }
+        url: { type: string, format: uri }
+        author: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        closedAt: { type: [string, "null"], format: date-time }
+        state:
+          type: string
+          description: "`OPEN` or `CLOSED` for an issue; `OPEN`, `CLOSED` or `MERGED` for a pull"
+        labels: { type: array, items: { $ref: "#/components/schemas/Label" } }
+        assignees: { type: array, items: { type: string } }
+        milestone: { oneOf: [{ $ref: "#/components/schemas/Milestone" }, { type: "null" }] }
+        commentsCount: { type: integer }
+        comments: { type: array, items: { $ref: "#/components/schemas/Comment" } }
+        events: { type: array, items: { $ref: "#/components/schemas/Event" } }
+        readAt: { type: string, format: date-time, description: "When the host last said what this record is (the sync, a refresh, an edit's read-back)" }
+        stateReason: { type: [string, "null"], description: "Issues: why it was closed (GitHub: completed or not_planned)" }
+        issueType: { type: [string, "null"], description: "Issues: GitHub's issue type, when the organization has them" }
+        dueDate: { type: [string, "null"], format: date }
+        startDate: { type: [string, "null"], format: date }
+        parent: { $ref: "#/components/schemas/Ref" }
+        subIssues: { type: array, items: { $ref: "#/components/schemas/Ref" } }
+        blockedBy: { type: array, items: { $ref: "#/components/schemas/Ref" } }
+        blocking: { type: array, items: { $ref: "#/components/schemas/Ref" } }
+        parentEpic:
+          oneOf: [{ $ref: "#/components/schemas/ParentEpic" }, { type: "null" }]
+        locked: { type: boolean }
+        confidential: { type: boolean, description: "GitLab" }
+        weight: { type: number, description: "GitLab (a paid plan)" }
+        isPrivate: { type: boolean, description: "Redmine" }
+        labelEvents: { type: integer }
+        customFields: { type: array, items: { $ref: "#/components/schemas/CustomField" }, description: "Redmine" }
+        watchers: { type: array, items: { $ref: "#/components/schemas/IdName" }, description: "Redmine" }
+        attachments: { type: array, items: { $ref: "#/components/schemas/Attachment" }, description: "Redmine" }
+        tracker: { oneOf: [{ $ref: "#/components/schemas/IdName" }, { type: "null" }], description: "Redmine" }
+        priority: { oneOf: [{ $ref: "#/components/schemas/IdName" }, { type: "null" }], description: "Redmine" }
+        assigneeId: { type: integer, description: "Redmine" }
+        versionId: { type: integer, description: "Redmine" }
+        categoryId: { type: integer, description: "Redmine" }
+        doneRatio: { type: integer, description: "Redmine, 0 to 100" }
+        estimatedHours: { type: number, description: "Redmine" }
+        parentId: { type: integer, description: "Redmine" }
+        relations: { type: array, items: { $ref: "#/components/schemas/Relation" }, description: "Redmine" }
+        isDraft: { type: boolean, description: "Pulls" }
+        mergedAt: { type: [string, "null"], format: date-time, description: "Pulls" }
+        mergedBy: { type: [string, "null"], description: "Pulls" }
+        reviewDecision: { type: [string, "null"], description: "Pulls" }
+        base: { type: string, description: "Pulls: the branch it merges into" }
+        head: { type: string, description: "Pulls: its own branch" }
+        additions: { type: integer, description: "Pulls" }
+        deletions: { type: integer, description: "Pulls" }
+        changedFiles: { type: integer, description: "Pulls" }
+        closes: { type: array, items: { $ref: "#/components/schemas/Ref" }, description: "Pulls: the issues it closes" }
+        commitsCount: { type: integer, description: "Pulls" }
+        commits: { type: array, items: { $ref: "#/components/schemas/PullCommit" }, description: "Pulls" }
+        reviews: { type: array, items: { $ref: "#/components/schemas/Review" }, description: "Pulls" }
+        reviewers: { type: array, items: { type: string }, description: "Pulls" }
+        mergeCommitSha: { type: [string, "null"], description: "Pulls" }
+        repo:
+          type: string
+          description: "Only in a tracker's view of a linked pull: the code repo the pull belongs to. Never stored."
+      additionalProperties: true
+
+    Detail:
+      description: |
+        What the item page reads for one issue or pull request: the record's body, comments, events, commits and reviews.
+        The server answers with the whole stored record, which has all of these.
+      allOf:
+        - $ref: "#/components/schemas/Record"
+
+    Issue:
+      description: An issue as the timeline payload lists it (no body, comments, events or history; see Record for the rest)
+      type: object
+      required: [id, kind, key, number, title, url, author, createdAt, updatedAt, closedAt, labels, assignees, milestone, commentsCount, labelEvents, state]
+      properties:
+        id: { type: string }
+        kind: { type: string, const: issue }
+        key: { type: string }
+        number: { type: [integer, "null"] }
+        title: { type: string }
+        url: { type: string, format: uri }
+        author: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        closedAt: { type: [string, "null"], format: date-time }
+        dueDate: { type: [string, "null"], format: date, description: "Its own due date, when its tracker has one (GitLab, Redmine, Jira)" }
+        startDate: { type: [string, "null"], format: date, description: "Its own start date, when its tracker has one (Redmine)" }
+        labels: { type: array, items: { $ref: "#/components/schemas/Label" } }
+        assignees: { type: array, items: { type: string } }
+        milestone: { oneOf: [{ $ref: "#/components/schemas/Milestone" }, { type: "null" }] }
+        commentsCount: { type: integer }
+        labelEvents: { type: integer }
+        state: { type: string, enum: [OPEN, CLOSED] }
+        stateReason: { type: [string, "null"], description: "Why it was closed, when the sync kept it (absent otherwise)" }
+        parentEpic: { oneOf: [{ $ref: "#/components/schemas/ParentEpic" }, { type: "null" }] }
+        customFields: { type: array, items: { $ref: "#/components/schemas/CustomField" } }
+      additionalProperties: true
+
+    Pull:
+      description: A pull or merge request as the timeline payload lists it (no body, comments, events, commit list or reviews; see Record for the rest)
+      type: object
+      required: [id, kind, key, number, title, url, author, createdAt, updatedAt, closedAt, labels, assignees, milestone, commentsCount, labelEvents, state, isDraft, mergedAt, mergedBy, reviewDecision, base, head, additions, deletions, changedFiles, commitsCount, firstReviewAt, reviewsCount]
+      properties:
+        id: { type: string }
+        kind: { type: string, const: pull }
+        key: { type: string, description: "`12`, or `label#12` for a linked pull" }
+        number: { type: [integer, "null"] }
+        title: { type: string }
+        url: { type: string, format: uri }
+        author: { type: [string, "null"] }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        closedAt: { type: [string, "null"], format: date-time }
+        labels: { type: array, items: { $ref: "#/components/schemas/Label" } }
+        assignees: { type: array, items: { type: string } }
+        milestone: { oneOf: [{ $ref: "#/components/schemas/Milestone" }, { type: "null" }] }
+        commentsCount: { type: integer }
+        labelEvents: { type: integer }
+        state: { type: string, enum: [OPEN, CLOSED, MERGED] }
+        isDraft: { type: boolean }
+        mergedAt: { type: [string, "null"], format: date-time }
+        mergedBy: { type: [string, "null"] }
+        reviewDecision: { type: [string, "null"] }
+        base: { type: string }
+        head: { type: string }
+        additions: { type: integer }
+        deletions: { type: integer }
+        changedFiles: { type: integer }
+        closes: { type: array, items: { $ref: "#/components/schemas/Ref" }, description: "The issues it closes; absent when there are none" }
+        commitsCount: { type: integer }
+        firstReviewAt: { type: [string, "null"], format: date-time, description: "The earliest review's date" }
+        reviewsCount: { type: integer }
+        repo: { type: string, description: "On a tracker's view of a linked pull: the code repo it belongs to" }
+      additionalProperties: true
+
+    Link:
+      type: object
+      description: A pull request that names an issue, and how
+      required: [issue, pull, via]
+      properties:
+        issue: { type: string }
+        pull: { type: string }
+        via: { type: string, enum: [closes, event, mention, key] }
+
+    TreeEdge:
+      type: object
+      description: A parent-child edge of the hierarchy
+      required: [parent, child, via, checked]
+      properties:
+        parent: { type: string }
+        child: { type: string }
+        via: { type: string, enum: [native, checklist] }
+        checked: { type: [boolean, "null"], description: "For a checklist item: whether it is ticked" }
+
+    DepEdge:
+      type: object
+      description: "A blocker and the issue it blocks"
+      required: [blocker, blocked, via]
+      properties:
+        blocker: { type: string }
+        blocked: { type: string }
+        via: { type: string, enum: [native, text] }
+
+    Vocabulary:
+      type: object
+      description: The words that mean blocked-by, blocks and the custom field keys, as the server reads them (defaults or the VOCABULARY_FILE)
+      required: [blockedBy, blocks, fieldKeys]
+      properties:
+        blockedBy: { type: array, items: { type: string } }
+        blocks: { type: array, items: { type: string } }
+        fieldKeys: { type: array, items: { type: string } }
+
+    CiRun:
+      type: object
+      description: The last CI run of a pull request, or the last run of another kind of workflow
+      required: [state, url, at, count]
+      properties:
+        state:
+          type: string
+          description: "passed, failed, skipped, running, cancelled, pending or unknown (other host conclusions pass through as they are)"
+        url: { type: string, format: uri }
+        at: { type: [string, "null"], format: date-time }
+        count: { type: integer, description: "How many CI runs the pull's commits had" }
+
+    CiChange:
+      type: object
+      description: A commit that changed the CI definition (a workflow file on GitHub, `.gitlab-ci.yml` on GitLab)
+      required: [sha, title, author, at, url]
+      properties:
+        sha: { type: string }
+        title: { type: string }
+        author: { type: [string, "null"] }
+        at: { type: [string, "null"], format: date-time }
+        url: { type: [string, "null"], format: uri }
+
+    CiSummary:
+      type: object
+      description: "The CI state of a repo: its pull requests' last runs, the CI definition's changes, and the other workflows"
+      required: [byPr, changes, other, lastRunAt]
+      properties:
+        byPr:
+          type: object
+          description: "Per pull request key"
+          additionalProperties: { $ref: "#/components/schemas/CiRun" }
+        changes:
+          type: array
+          items: { $ref: "#/components/schemas/CiChange" }
+        other:
+          type: object
+          description: "Per workflow category: its run count and last run"
+          additionalProperties:
+            type: object
+            required: [count, last]
+            properties:
+              count: { type: integer }
+              last:
+                oneOf:
+                  - type: object
+                    required: [url, at, state, name]
+                    properties:
+                      url: { type: string, format: uri }
+                      at: { type: string, format: date-time }
+                      state: { type: string }
+                      name: { type: string }
+                  - type: "null"
+        lastRunAt: { type: [string, "null"], format: date-time }
+
+    SyncEntry:
+      type: object
+      description: One sync of the repo, kept for the last 50
+      required: [at, full, issues, pulls, ms]
+      properties:
+        at: { type: string, format: date-time }
+        full: { type: boolean }
+        issues: { type: integer }
+        pulls: { type: integer }
+        ms: { type: integer }
+
+    Meta:
+      type: object
+      required: [repo, lastSync, fullSyncAt, syncs]
+      properties:
+        repo: { type: [string, "null"] }
+        lastSync: { type: [string, "null"], format: date-time }
+        fullSyncAt: { type: [string, "null"], format: date-time }
+        schema: { type: integer, description: "The store's file format version" }
+        syncs: { type: array, items: { $ref: "#/components/schemas/SyncEntry" } }
+        totals:
+          type: object
+          required: [issues, pulls]
+          properties:
+            issues: { type: integer }
+            pulls: { type: integer }
+
+    SyncStatus:
+      type: object
+      description: What the server is doing for the repo
+      required: [syncing, lastError, commitsError, ciError, nextSyncAt, progress]
+      properties:
+        syncing: { type: boolean }
+        lastError: { type: [string, "null"], description: "The last sync's error, or null" }
+        commitsError: { type: [string, "null"], description: "The last commits read's error" }
+        ciError: { type: [string, "null"], description: "The last CI read's error" }
+        nextSyncAt: { type: [string, "null"], format: date-time }
+        progress:
+          oneOf:
+            - type: object
+              required: [phase, done, total]
+              properties:
+                phase: { type: string }
+                done: { type: integer }
+                total: { type: [integer, "null"] }
+            - type: "null"
+
+    Payload:
+      type: object
+      description: The timeline of one repo (`GET /api/data`)
+      required: [mode, linked, vocabulary, ci, meta, issues, pulls, links, tree, deps, status]
+      properties:
+        mode: { type: string, enum: [read, write], description: "What the repo allows: read unless it was switched to write" }
+        linked:
+          type: array
+          items: { type: string }
+          description: "For a tracker: the code repos it is linked to that the caller may see. Empty for a code repo."
+        vocabulary: { $ref: "#/components/schemas/Vocabulary" }
+        ci: { $ref: "#/components/schemas/CiSummary" }
+        meta: { $ref: "#/components/schemas/Meta" }
+        issues: { type: array, items: { $ref: "#/components/schemas/Issue" } }
+        pulls: { type: array, items: { $ref: "#/components/schemas/Pull" } }
+        links: { type: array, items: { $ref: "#/components/schemas/Link" } }
+        tree: { type: array, items: { $ref: "#/components/schemas/TreeEdge" } }
+        deps: { type: array, items: { $ref: "#/components/schemas/DepEdge" } }
+        status: { $ref: "#/components/schemas/SyncStatus" }
+
+    Me:
+      type: object
+      description: The person signed in, and the site the session is for
+      required: [user, instance, provider]
+      properties:
+        user: { $ref: "#/components/schemas/User" }
+        instance:
+          type: string
+          description: "The site (its origin, for example `https://gitlab.example.com`), or `github` for GitHub"
+        provider: { type: string, enum: [redmine, github, gitlab] }
+
+    User:
+      type: object
+      description: The account a credential belongs to
+      required: [id, login, name, admin]
+      properties:
+        id: { type: integer }
+        login: { type: string }
+        name: { type: string }
+        admin: { type: boolean, description: "A Redmine administrator" }
+
+    SignIn:
+      type: object
+      required: [key]
+      properties:
+        provider:
+          type: string
+          enum: [redmine, github, gitlab]
+          default: redmine
+          description: Which host the key is for
+        key:
+          type: string
+          description: "A Redmine API key, a GitHub token or a GitLab token"
+        instance:
+          type: string
+          description: "The site's URL, for example `https://redmine.example.com`. Not needed for GitHub. For GitLab, needed when more than one GitLab site is configured."
+
+    SignedOut:
+      type: object
+      required: [signedOut]
+      properties:
+        signedOut: { type: boolean, const: true }
+
+    RepoMode:
+      type: string
+      enum: [read, write]
+
+    RepoList:
+      type: object
+      required: [repos, links, modes, canConfigure]
+      properties:
+        repos:
+          type: array
+          items: { type: string }
+          description: The repos the caller may see, in the order they were added
+        links:
+          type: object
+          description: "Per tracker: the code repos linked to it that the caller may see"
+          additionalProperties:
+            type: array
+            items: { type: string }
+        modes:
+          type: object
+          description: "Per repo: its mode"
+          additionalProperties: { $ref: "#/components/schemas/RepoMode" }
+        canConfigure:
+          type: boolean
+          description: True only for a request from this machine
+
+    RepoAdd:
+      type: object
+      required: [repo]
+      properties:
+        provider:
+          type: string
+          enum: [github, gitlab, redmine, jira]
+          default: github
+          description: Which host the repo is on
+        repo:
+          type: string
+          description: "`owner/name` (GitHub), a GitLab project's URL, a Redmine project's URL or identifier, a Jira project's URL or key"
+        mode: { $ref: "#/components/schemas/RepoMode", default: read }
+
+    RepoAdded:
+      type: object
+      required: [repos, repo, added, mode]
+      properties:
+        repos: { type: array, items: { type: string } }
+        repo: { type: string }
+        added: { type: boolean, description: "False when the repo was already configured" }
+        mode: { $ref: "#/components/schemas/RepoMode" }
+
+    RepoModeInput:
+      type: object
+      required: [mode]
+      properties:
+        mode: { $ref: "#/components/schemas/RepoMode" }
+
+    RepoModeSet:
+      type: object
+      required: [repo, mode]
+      properties:
+        repo: { type: string }
+        mode: { $ref: "#/components/schemas/RepoMode" }
+
+    Links:
+      type: object
+      description: The code repos a tracker names by key. An empty list unlinks it.
+      required: [tracker]
+      properties:
+        tracker: { type: string, description: "A configured Jira or Redmine repo" }
+        code:
+          type: array
+          items: { type: string }
+          description: "Configured GitHub or GitLab repos. Two of them may not share a name."
+
+    LinksSaved:
+      type: object
+      required: [tracker, code]
+      properties:
+        tracker: { type: string }
+        code: { type: array, items: { type: string } }
+
+    SearchHit:
+      type: object
+      required: [key, kind, title, state, snippet]
+      properties:
+        key: { type: string }
+        kind: { type: string, enum: [issue, pull] }
+        title: { type: string }
+        state: { type: string }
+        snippet:
+          type: [string, "null"]
+          description: The text around the match, when the match is in the body or a comment
+
+    SearchResult:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          maxItems: 50
+          items: { $ref: "#/components/schemas/SearchHit" }
+
+    EditOptions:
+      type: object
+      description: |
+        What an edit form offers. Every list is present (empty when the host has none). GitHub's member id is the login;
+        GitLab's is the numeric id.
+      required: [trackers, priorities, members, versions, categories, customFields, relationTypes]
+      properties:
+        trackers: { type: array, items: { $ref: "#/components/schemas/IdName" } }
+        priorities:
+          type: array
+          items:
+            type: object
+            required: [id, name, isDefault]
+            properties:
+              id: { type: integer }
+              name: { type: string }
+              isDefault: { type: boolean }
+        members:
+          type: array
+          items:
+            type: object
+            required: [id, name]
+            properties:
+              id: { type: [integer, string] }
+              name: { type: string }
+        labels: { type: array, items: { $ref: "#/components/schemas/Label" }, description: "GitHub and GitLab" }
+        milestones: { type: array, items: { $ref: "#/components/schemas/IdName" }, description: "GitHub and GitLab: open milestones, with the host's ids" }
+        versions: { type: array, items: { $ref: "#/components/schemas/IdName" } }
+        categories: { type: array, items: { $ref: "#/components/schemas/IdName" } }
+        customFields:
+          type: array
+          items:
+            type: object
+            required: [id, name, format, multiple, values]
+            properties:
+              id: { type: integer }
+              name: { type: string }
+              format: { type: [string, "null"] }
+              multiple: { type: boolean }
+              values: { type: array, items: { type: string } }
+        activities: { type: array, items: { $ref: "#/components/schemas/IdName" }, description: "Redmine: the activities of a time entry" }
+        issueTypes: { type: array, items: { $ref: "#/components/schemas/IdName" }, description: "GitHub: the repo's issue types" }
+        relationTypes:
+          type: array
+          items: { type: string }
+          description: "The relation types Redmine takes (for `addRelations`)"
+
+    AttachmentInput:
+      type: object
+      required: [filename, data]
+      properties:
+        filename: { type: string }
+        data: { type: string, contentEncoding: base64, description: "The file, base64. At most 5 MB decoded." }
+        contentType: { type: string, description: "Redmine: defaults to application/octet-stream" }
+
+    RelationInput:
+      type: object
+      description: A Redmine relation to create (`addRelations`)
+      required: [type, to]
+      properties:
+        type: { type: string, enum: [relates, duplicates, duplicated, blocks, blocked, precedes, follows, copied_to, copied_from] }
+        to: { $ref: "#/components/schemas/Ref", description: "The other issue's id" }
+        delay: { type: [integer, "null"], description: "Days, for a precedes or follows relation" }
+
+    LinkInput:
+      type: object
+      description: "A relation between issues on GitHub or GitLab (`addLinks` / `removeLinks`). GitHub has no `relates`: it is refused."
+      required: [type, to]
+      properties:
+        type: { type: string, enum: [blocks, blockedBy, relates] }
+        to: { $ref: "#/components/schemas/Ref", description: "The other issue's number or iid" }
+
+    EditComment:
+      type: object
+      required: [id, body]
+      properties:
+        id: { $ref: "#/components/schemas/Ref" }
+        body: { type: string }
+
+    TimeEntryInput:
+      type: object
+      description: "Redmine: one time entry on the issue"
+      required: [hours, activityId]
+      properties:
+        hours: { type: number }
+        activityId: { type: integer }
+        comments: { type: string }
+
+    IssueChanges:
+      type: object
+      description: |
+        An issue edit. Every field is optional; at least one known field is needed (otherwise 400). Each host takes the fields
+        it supports and ignores the others (see each field). Redmine's relations (`addRelations`, `removeRelations`) and
+        watchers, time entries and attachments are Redmine only; `addLinks` and `removeLinks` are GitHub and GitLab.
+      properties:
+        title: { type: string }
+        body: { type: string }
+        dueDate: { type: [string, "null"], format: date }
+        startDate: { type: [string, "null"], format: date, description: "Redmine" }
+        state: { type: string, enum: [OPEN, CLOSED] }
+        stateReason: { type: [string, "null"], description: "GitHub: `completed` or `not_planned`, when closing" }
+        comment: { type: string, description: "A note added with the change" }
+        privateNote: { type: boolean, description: "Redmine: the note is private" }
+        customFields:
+          type: object
+          description: "Redmine: the value of each custom field, keyed by the field's id"
+          additionalProperties:
+            oneOf:
+              - type: string
+              - type: array
+                items: { type: string }
+              - type: "null"
+        tracker: { type: integer, description: "Redmine: a tracker id" }
+        priority: { type: integer, description: "Redmine: a priority id" }
+        assignee: { type: [integer, "null"], description: "Redmine: a user id, or null to clear" }
+        version: { type: [integer, "null"], description: "Redmine: a version id, or null to clear" }
+        category: { type: [integer, "null"], description: "Redmine: a category id, or null to clear" }
+        doneRatio: { type: integer, minimum: 0, maximum: 100, description: "Redmine" }
+        estimatedHours: { type: [number, "null"], description: "Redmine" }
+        parent: { oneOf: [{ $ref: "#/components/schemas/Ref" }, { type: "null" }], description: "The parent issue's number or id; null removes it. GitHub, GitLab and Redmine." }
+        addRelations: { type: array, items: { $ref: "#/components/schemas/RelationInput" }, description: "Redmine" }
+        removeRelations: { type: array, items: { type: integer }, description: "Redmine: relation ids" }
+        addLinks: { type: array, items: { $ref: "#/components/schemas/LinkInput" }, description: "GitHub and GitLab" }
+        removeLinks: { type: array, items: { $ref: "#/components/schemas/LinkInput" }, description: "GitHub and GitLab" }
+        labels: { type: array, items: { type: string }, description: "GitHub and GitLab: the label names" }
+        assignees:
+          type: array
+          items: { oneOf: [{ type: string }, { type: integer }] }
+          description: "GitHub: logins. GitLab: user ids."
+        milestone: { type: [integer, "null"], description: "GitHub and GitLab: the milestone's id, or null to remove it" }
+        confidential: { type: boolean, description: "GitLab" }
+        weight: { type: [number, "null"], description: "GitLab (a paid plan)" }
+        timeEstimate: { type: string, description: "GitLab: a duration such as `2h30m`; empty clears it" }
+        addSpent: { type: string, description: "GitLab: a duration of time spent to add" }
+        editComments:
+          type: array
+          items: { $ref: "#/components/schemas/EditComment" }
+          description: "GitHub and GitLab: notes to change, by id"
+        deleteComments:
+          type: array
+          items: { $ref: "#/components/schemas/Ref" }
+          description: "GitHub and GitLab: note ids to delete"
+        locked: { type: boolean, description: "GitHub: lock or unlock the conversation" }
+        type: { type: [string, "null"], description: "GitHub: an issue type's name (organizations with issue types)" }
+        isPrivate: { type: boolean, description: "Redmine" }
+        addWatchers: { type: array, items: { type: integer }, description: "Redmine: user ids" }
+        removeWatchers: { type: array, items: { type: integer }, description: "Redmine: user ids" }
+        timeEntry: { $ref: "#/components/schemas/TimeEntryInput" }
+        attachments:
+          type: array
+          maxItems: 5
+          items: { $ref: "#/components/schemas/AttachmentInput" }
+          description: "Redmine: files to attach, at most 5 at a time"
+        removeAttachments: { type: array, items: { type: integer }, description: "Redmine: attachment ids" }
+
+    PullChanges:
+      type: object
+      description: "An edit of a pull request (GitHub) or merge request (GitLab). Every field is optional; at least one is needed."
+      properties:
+        title: { type: string }
+        body: { type: string }
+        state: { type: string, enum: [OPEN, CLOSED], description: "A merged pull cannot be edited to another state" }
+        labels: { type: array, items: { type: string } }
+        assignees:
+          type: array
+          items: { oneOf: [{ type: string }, { type: integer }] }
+          description: "GitHub: logins. GitLab: user ids."
+        milestone: { type: [integer, "null"] }
+        reviewers:
+          type: array
+          items: { oneOf: [{ type: string }, { type: integer }] }
+          description: "GitHub: logins. GitLab: user ids."
+        isDraft: { type: boolean }
+        comment: { type: string, description: "A comment added with the change" }
+
+    NewIssue:
+      type: object
+      description: "A new issue. `title` is needed. GitHub and GitLab read the first six fields; Redmine reads the title, body, tracker, priority, assignee, version, category, parent, dates and `isPrivate`. Other fields are ignored."
+      required: [title]
+      properties:
+        title: { type: string }
+        body: { type: string }
+        labels: { type: array, items: { type: string } }
+        assignees:
+          type: array
+          items: { oneOf: [{ type: string }, { type: integer }] }
+        milestone: { type: [integer, "null"] }
+        dueDate: { type: [string, "null"], format: date }
+        startDate: { type: [string, "null"], format: date, description: "Redmine" }
+        tracker: { type: integer, description: "Redmine" }
+        priority: { type: integer, description: "Redmine" }
+        assignee: { type: integer, description: "Redmine: a user id" }
+        version: { type: integer, description: "Redmine" }
+        category: { type: integer, description: "Redmine" }
+        parent: { $ref: "#/components/schemas/Ref", description: "Redmine" }
+        isPrivate: { type: boolean, description: "Redmine" }
+
+    RefreshResult:
+      type: object
+      required: [record, changed]
+      properties:
+        record: { $ref: "#/components/schemas/Record" }
+        changed: { type: boolean, description: "Whether anything moved" }
+        throttled: { type: boolean, description: "True when the record was read less than a minute ago, and was not read again" }
+        fields:
+          type: array
+          items: { type: string }
+          description: "The fields that changed (not with `throttled`)"
+
+    IssueEdited:
+      description: The issue as the host now has it. `warnings` is set on GitHub and GitLab, for values the host did not keep.
+      allOf:
+        - $ref: "#/components/schemas/Record"
+        - type: object
+          properties:
+            warnings:
+              type: array
+              items: { type: string }
+
+    CommitRow:
+      type: object
+      description: |
+        A commit as the list shows it: the store keeps the first six fields. `pr`, `issues` and `inHistory` are added when the
+        list is made; `repo` is set for a tracker's linked commits.
+      required: [sha, title, author, at, additions, deletions]
+      properties:
+        sha: { type: string }
+        title: { type: string }
+        author: { type: [string, "null"] }
+        at: { type: [string, "null"], format: date-time }
+        additions: { type: [integer, "null"] }
+        deletions: { type: [integer, "null"] }
+        pr: { type: [string, "null"], description: "The pull request the commit belongs to (its own commit, or named in its title)" }
+        issues: { type: array, items: { type: string }, description: "The issues it closes or names" }
+        inHistory: { type: boolean, description: "On the default branch's history (false for a PR's own commit that never landed there)" }
+        repo: { type: string, description: "A tracker's linked commit: the code repo it is in" }
+
+    CommitList:
+      type: object
+      required: [total, synced, lastSync, items]
+      properties:
+        total: { type: integer, description: "Matching the search, before the page" }
+        synced: { type: integer, description: "Stored in all" }
+        lastSync: { type: [string, "null"], format: date-time }
+        items: { type: array, items: { $ref: "#/components/schemas/CommitRow" } }
+
+    CommitFile:
+      type: object
+      required: [path, oldPath, status, additions, deletions, patch, note]
+      properties:
+        path: { type: string }
+        oldPath: { type: [string, "null"] }
+        status: { type: string, enum: [added, deleted, modified, renamed] }
+        additions: { type: integer }
+        deletions: { type: integer }
+        patch: { type: [string, "null"], description: "The diff. Null for a binary file, one too large, or one the host did not include (then `note` says why)" }
+        note: { type: [string, "null"] }
+
+    CommitDetail:
+      type: object
+      description: One commit with its files. `inHistory` is false for a PR's own commit that never landed on the default branch.
+      required: [sha, title, author, at, additions, deletions, pr, issues, inHistory, files, truncated]
+      properties:
+        sha: { type: string }
+        title: { type: string }
+        author: { type: [string, "null"] }
+        at: { type: [string, "null"], format: date-time }
+        additions: { type: [integer, "null"] }
+        deletions: { type: [integer, "null"] }
+        pr: { type: [string, "null"] }
+        issues: { type: array, items: { type: string } }
+        inHistory: { type: boolean }
+        files: { type: array, items: { $ref: "#/components/schemas/CommitFile" } }
+        truncated: { type: boolean, description: "True when the diffs of some files were cut to fit" }
+
+    MergeMethod:
+      type: object
+      required: [method]
+      properties:
+        method:
+          type: [string, "null"]
+          enum: [squash, merge commit, rebase, null]
+          description: "How the merged pull landed on the default branch. Null when it is not merged, or the host cannot say."
+
+    SignInOptions:
+      type: object
+      required: [methods]
+      properties:
+        methods:
+          type: array
+          items:
+            type: object
+            required: [provider, origin, oauth, token]
+            properties:
+              provider: { type: string, enum: [github, gitlab, redmine] }
+              origin: { type: string, description: "\"github\", or the instance's URL" }
+              oauth: { type: boolean, description: "The host's own sign-in page is available (GET /api/oauth/{provider}/start)" }
+              token: { type: boolean, description: "A pasted personal access token or API key (POST /api/session)" }
+    ChangeEvent:
+      type: object
+      description: What changed in a repo, as `GET /api/events` sends it.
+      required: [repo, type, changed, at]
+      properties:
+        repo: { type: string, description: "The repo key" }
+        type:
+          type: string
+          enum: [sync-start, sync-end, edit]
+          description: "A sync started or ended, or a record was edited from this server"
+        items:
+          type: array
+          description: "The records an edit is about (the ones the caller may see)"
+          items:
+            type: object
+            required: [kind, key]
+            properties:
+              kind: { type: string, enum: [issue, pull] }
+              key: { type: string }
+        changed:
+          type: integer
+          description: "For sync-end: how many issues and pulls the sync read again (0: nothing new)"
+        at: { type: string, format: date-time }
+    WebhookAccepted:
+      type: object
+      required: [provider, event, repos]
+      properties:
+        provider: { type: string, enum: [github, gitlab, jira, generic] }
+        event: { type: string, description: "The host's name for the delivery (ping needs no sync)" }
+        repos:
+          type: array
+          items: { type: string }
+          description: "The configured repos it will sync"
+    SyncStarted:
+      type: object
+      required: [started]
+      properties:
+        started:
+          type: boolean
+          description: "True when this call started a sync; false when one was already running for the repo"
