@@ -1,0 +1,20 @@
+# Keep the build context small and never send local data, secrets or build output into the image.
+.git
+.claude
+.gitlab-ci.yml
+node_modules
+**/node_modules
+data
+bin
+dist
+npm
+test
+docs
+.env
+.env.*
+!.env.example
+web/dist
+internal/webui/dist/*
+!internal/webui/dist/README
+*.log
+*.pid
