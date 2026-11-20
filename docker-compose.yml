@@ -1,0 +1,23 @@
+# issue-timeline in a container: `docker compose up -d` to start it, `docker compose logs -f` to read its log.
+# Settings go in .env (copy .env.example and fill in what you use). Secrets can also go in with
+#   docker compose exec issue-timeline issue-timeline credentials set <name>
+# and then live in the volume, not in .env.
+
+services:
+  issue-timeline:
+    build: .
+    image: issue-timeline:local
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      # Published on this machine's loopback only. To reach it from other machines, use a reverse proxy with
+      # ALLOWED_HOSTS and PUBLIC_URL set (see the README), not an open port.
+      - "127.0.0.1:4310:4310"
+    volumes:
+      # A named volume, so the container's user can write to it whatever the host's user IDs are.
+      - issue-timeline-data:/data
+    restart: unless-stopped
+
+volumes:
+  issue-timeline-data:
